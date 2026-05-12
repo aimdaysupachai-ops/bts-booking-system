@@ -17,6 +17,7 @@ type BtsCard = {
   card_id: string;
   balance: number;
   card_status: string;
+  current_booking_id?: string | null;
   is_active: boolean;
 };
 
@@ -56,24 +57,15 @@ function addHours(value: string, hours: number) {
 }
 
 function formatDate(value: string) {
+  if (!value) return "-";
   return new Date(value).toLocaleString("th-TH", {
     dateStyle: "medium",
     timeStyle: "short",
   });
 }
 
-function Card({
-  children,
-  className = "",
-}: {
-  children: React.ReactNode;
-  className?: string;
-}) {
-  return (
-    <div className={`rounded-2xl border bg-white p-5 shadow-sm ${className}`}>
-      {children}
-    </div>
-  );
+function Card({ children, className = "" }: { children: React.ReactNode; className?: string }) {
+  return <div className={`rounded-2xl border bg-white p-5 shadow-sm ${className}`}>{children}</div>;
 }
 
 function Button({
@@ -116,11 +108,7 @@ function Badge({
     red: "bg-red-100 text-red-700",
   };
 
-  return (
-    <span className={`rounded-full px-3 py-1 text-xs font-bold ${map[tone]}`}>
-      {children}
-    </span>
-  );
+  return <span className={`rounded-full px-3 py-1 text-xs font-bold ${map[tone]}`}>{children}</span>;
 }
 
 export default function App() {
@@ -138,6 +126,7 @@ export default function App() {
   const [bookings, setBookings] = useState<Booking[]>([]);
   const [notifications, setNotifications] = useState<Notification[]>([]);
   const [fare, setFare] = useState(0);
+  const [loading, setLoading] = useState(false);
 
   const stationLabel = (id: string) => {
     const s = stations.find((x) => x.station_id === id);
@@ -147,7 +136,7 @@ export default function App() {
   const loadCards = async () => {
     const { data, error } = await supabase
       .from("bts_cards")
-      .select("*")
+      .select("card_id,balance,card_status,current_booking_id,is_active")
       .eq("is_active", true)
       .order("card_id", { ascending: true });
 
@@ -159,16 +148,74 @@ export default function App() {
     setCards((data || []) as BtsCard[]);
   };
 
+  const mapBookingRow = (row: any): Booking => ({
+    id: row.title,
+    userName: row.user_name,
+    userEmail: row.user_email,
+    origin: row.origin_code,
+    destination: row.destination_code,
+    trip: row.trip_type,
+    fare: Number(row.fare),
+    cardId: row.card_id,
+    bookingAt: row.booking_datetime,
+    holdUntil: row.hold_until,
+    status: row.booking_status,
+    calendar: row.outlook_status || "Pending",
+  });
+
+  const loadBookings = async () => {
+    const { data, error } = await supabase
+      .from("bts_bookings")
+      .select("*")
+      .order("created_at", { ascending: false });
+
+    if (error) {
+      console.error("Load bookings error", error);
+      return;
+    }
+
+    setBookings((data || []).map(mapBookingRow));
+  };
+
+  const loadNotifications = async () => {
+    const { data, error } = await supabase
+      .from("bts_notifications")
+      .select("*")
+      .order("created_at", { ascending: false });
+
+    if (error) {
+      console.error("Load notifications error", error);
+      return;
+    }
+
+    setNotifications(
+      (data || []).map((row: any) => ({
+        id: row.id ? String(row.id) : row.title,
+        to: row.target,
+        title: row.title,
+        message: row.message,
+        at: row.created_at || new Date().toISOString(),
+      }))
+    );
+  };
+
+  const refreshAll = async () => {
+    await Promise.all([loadCards(), loadBookings(), loadNotifications()]);
+  };
+
   useEffect(() => {
     async function loadMasterData() {
+      setLoading(true);
+
       const { data: stationData, error: stationError } = await supabase
         .from("bts_stations")
-        .select("*")
+        .select("station_id,station_name,line_name,sort_order")
         .eq("is_active", true)
         .order("sort_order", { ascending: true });
 
       if (stationError) {
         alert("Load stations error: " + stationError.message);
+        setLoading(false);
         return;
       }
 
@@ -180,7 +227,8 @@ export default function App() {
         setDestination(loadedStations[1].station_id);
       }
 
-      await loadCards();
+      await refreshAll();
+      setLoading(false);
     }
 
     loadMasterData();
@@ -201,7 +249,7 @@ export default function App() {
         .maybeSingle();
 
       if (error) {
-        console.error(error);
+        console.error("Load fare error", error);
         setFare(0);
         return;
       }
@@ -219,36 +267,36 @@ export default function App() {
       .sort((a, b) => Number(a.balance) - Number(b.balance))[0];
   }, [cards, fare]);
 
-  const notify = (to: string, title: string, message: string) => {
-    setNotifications((prev) => [
-      {
-        id: `NT-${prev.length + 1}`,
-        to,
-        title,
-        message,
-        at: new Date().toISOString(),
-      },
-      ...prev,
-    ]);
+  const notify = async (to: string, title: string, message: string, bookingId?: string) => {
+    const { error } = await supabase.from("bts_notifications").insert({
+      title,
+      target: to,
+      message,
+      is_read: false,
+      related_booking_id: bookingId || null,
+    });
+
+    if (error) {
+      console.error("Notification insert error", error);
+    }
+
+    await loadNotifications();
   };
 
   const updateCardBalance = async (cardId: string, newBalance: number) => {
-    const { error } = await supabase
+    const { data, error } = await supabase
       .from("bts_cards")
       .update({ balance: newBalance })
-      .eq("card_id", cardId);
+      .eq("card_id", cardId)
+      .select("card_id,balance,card_status,current_booking_id,is_active")
+      .single();
 
     if (error) {
       alert("Failed to update card balance: " + error.message);
       return;
     }
 
-    setCards((prev) =>
-      prev.map((card) =>
-        card.card_id === cardId ? { ...card, balance: newBalance } : card
-      )
-    );
-
+    setCards((prev) => prev.map((card) => (card.card_id === cardId ? (data as BtsCard) : card)));
     alert("Card balance updated successfully");
   };
 
@@ -259,10 +307,32 @@ export default function App() {
       return;
     }
 
+    setLoading(true);
+
     const holdUntil = addHours(bookingAt, HOLD_HOURS);
     const bookingId = `BK-${Date.now()}`;
-
     const newBalance = Number(selectedCard.balance) - fare;
+
+    const { error: bookingError } = await supabase.from("bts_bookings").insert({
+      title: bookingId,
+      user_name: user.name,
+      user_email: user.email.toLowerCase(),
+      booking_datetime: bookingAt,
+      hold_until: holdUntil,
+      origin_code: origin,
+      destination_code: destination,
+      trip_type: trip,
+      fare,
+      card_id: selectedCard.card_id,
+      booking_status: "Reserved",
+      outlook_status: "Pending",
+    });
+
+    if (bookingError) {
+      setLoading(false);
+      alert("Failed to create booking: " + bookingError.message);
+      return;
+    }
 
     const { error: cardError } = await supabase
       .from("bts_cards")
@@ -274,35 +344,21 @@ export default function App() {
       .eq("card_id", selectedCard.card_id);
 
     if (cardError) {
-      alert("Failed to reserve card: " + cardError.message);
+      setLoading(false);
+      alert("Booking created but failed to reserve card: " + cardError.message);
       return;
     }
 
-    const newBooking: Booking = {
-      id: bookingId,
-      userName: user.name,
-      userEmail: user.email,
-      origin,
-      destination,
-      trip,
-      fare,
-      cardId: selectedCard.card_id,
-      bookingAt,
-      holdUntil,
-      status: "Reserved",
-      calendar: "Outlook event pending",
-    };
-
-    setBookings((prev) => [newBooking, ...prev]);
-    await loadCards();
-
-    notify(
+    await notify(
       "Admin",
       "New booking",
-      `${user.name} booked ${selectedCard.card_id}: ${stationLabel(origin)} → ${stationLabel(destination)}.`
+      `${user.name} booked ${selectedCard.card_id}: ${stationLabel(origin)} → ${stationLabel(destination)}.`,
+      bookingId
     );
 
+    await refreshAll();
     setTab("bookings");
+    setLoading(false);
   };
 
   const editTrip = async (bookingId: string) => {
@@ -327,42 +383,46 @@ export default function App() {
 
     const newBalance = Number(currentCard.balance) - diff;
 
-    const { error } = await supabase
+    const { error: bookingError } = await supabase
+      .from("bts_bookings")
+      .update({ trip_type: newTrip, fare: newFare, outlook_status: "Updated" })
+      .eq("title", bookingId);
+
+    if (bookingError) {
+      alert("Failed to update booking: " + bookingError.message);
+      return;
+    }
+
+    const { error: cardError } = await supabase
       .from("bts_cards")
       .update({ balance: newBalance })
       .eq("card_id", b.cardId);
 
-    if (error) {
-      alert("Failed to update card balance: " + error.message);
+    if (cardError) {
+      alert("Failed to update card balance: " + cardError.message);
       return;
     }
 
-    setBookings((prev) =>
-      prev.map((x) =>
-        x.id === bookingId
-          ? {
-              ...x,
-              trip: newTrip,
-              fare: newFare,
-              calendar: "Outlook event updated",
-            }
-          : x
-      )
-    );
-
-    await loadCards();
-    notify("Admin", "Booking edited", `${b.userName} changed ${b.id} to ${newTrip}.`);
+    await notify("Admin", "Booking edited", `${b.userName} changed ${b.id} to ${newTrip}.`, bookingId);
+    await refreshAll();
   };
 
-  const requestCancel = (bookingId: string) => {
+  const requestCancel = async (bookingId: string) => {
     const b = bookings.find((x) => x.id === bookingId);
     if (!b) return;
 
-    setBookings((prev) =>
-      prev.map((x) => (x.id === bookingId ? { ...x, status: "Cancel Requested" } : x))
-    );
+    const { error } = await supabase
+      .from("bts_bookings")
+      .update({ booking_status: "Cancel Requested", outlook_status: "WaitingAdminCancellation" })
+      .eq("title", bookingId);
 
-    notify("Admin", "Cancel approval required", `${b.userName} requested cancellation for ${b.id}.`);
+    if (error) {
+      alert("Failed to request cancel: " + error.message);
+      return;
+    }
+
+    await notify("Admin", "Cancel approval required", `${b.userName} requested cancellation for ${b.id}.`, bookingId);
+    await refreshAll();
   };
 
   const approveCancel = async (bookingId: string) => {
@@ -372,7 +432,17 @@ export default function App() {
     const currentCard = cards.find((c) => c.card_id === b.cardId);
     if (!currentCard) return;
 
-    const { error } = await supabase
+    const { error: bookingError } = await supabase
+      .from("bts_bookings")
+      .update({ booking_status: "Cancelled", outlook_status: "Cancelled" })
+      .eq("title", bookingId);
+
+    if (bookingError) {
+      alert("Failed to approve cancel: " + bookingError.message);
+      return;
+    }
+
+    const { error: cardError } = await supabase
       .from("bts_cards")
       .update({
         card_status: "Available",
@@ -381,61 +451,59 @@ export default function App() {
       })
       .eq("card_id", b.cardId);
 
-    if (error) {
-      alert("Failed to approve cancel: " + error.message);
+    if (cardError) {
+      alert("Failed to update card: " + cardError.message);
       return;
     }
 
-    setBookings((prev) =>
-      prev.map((x) =>
-        x.id === bookingId
-          ? { ...x, status: "Cancelled", calendar: "Outlook event cancelled" }
-          : x
-      )
-    );
-
-    await loadCards();
-    notify(b.userEmail, "Cancel approved", `Admin approved cancellation for ${b.id}.`);
+    await notify(b.userEmail, "Cancel approved", `Admin approved cancellation for ${b.id}.`, bookingId);
+    await refreshAll();
   };
 
-  const requestReturn = (bookingId: string) => {
+  const requestReturn = async (bookingId: string) => {
     const b = bookings.find((x) => x.id === bookingId);
     if (!b) return;
 
-    setBookings((prev) =>
-      prev.map((x) => (x.id === bookingId ? { ...x, status: "Return Requested" } : x))
-    );
+    const { error } = await supabase
+      .from("bts_bookings")
+      .update({ booking_status: "Return Requested", outlook_status: "WaitingAdminReturn" })
+      .eq("title", bookingId);
 
-    notify("Admin", "Return approval required", `${b.userName} requested return for ${b.cardId}.`);
+    if (error) {
+      alert("Failed to request return: " + error.message);
+      return;
+    }
+
+    await notify("Admin", "Return approval required", `${b.userName} requested return for ${b.cardId}.`, bookingId);
+    await refreshAll();
   };
 
   const approveReturn = async (bookingId: string) => {
     const b = bookings.find((x) => x.id === bookingId);
     if (!b) return;
 
-    const { error } = await supabase
-      .from("bts_cards")
-      .update({
-        card_status: "Available",
-        current_booking_id: null,
-      })
-      .eq("card_id", b.cardId);
+    const { error: bookingError } = await supabase
+      .from("bts_bookings")
+      .update({ booking_status: "Returned", outlook_status: "Closed" })
+      .eq("title", bookingId);
 
-    if (error) {
-      alert("Failed to approve return: " + error.message);
+    if (bookingError) {
+      alert("Failed to approve return: " + bookingError.message);
       return;
     }
 
-    setBookings((prev) =>
-      prev.map((x) =>
-        x.id === bookingId
-          ? { ...x, status: "Returned", calendar: "Outlook event closed" }
-          : x
-      )
-    );
+    const { error: cardError } = await supabase
+      .from("bts_cards")
+      .update({ card_status: "Available", current_booking_id: null })
+      .eq("card_id", b.cardId);
 
-    await loadCards();
-    notify(b.userEmail, "Return approved", `Admin confirmed return of ${b.cardId}.`);
+    if (cardError) {
+      alert("Failed to update card: " + cardError.message);
+      return;
+    }
+
+    await notify(b.userEmail, "Return approved", `Admin confirmed return of ${b.cardId}.`, bookingId);
+    await refreshAll();
   };
 
   const statusTone = (status: string) => {
@@ -447,13 +515,9 @@ export default function App() {
   };
 
   const visibleBookings =
-    role === "Admin"
-      ? bookings
-      : bookings.filter((b) => b.userEmail === user.email && user.email !== "");
+    role === "Admin" ? bookings : bookings.filter((b) => b.userEmail === user.email.toLowerCase() && user.email !== "");
 
-  const visibleNoti = notifications.filter((n) =>
-    role === "Admin" ? n.to === "Admin" : n.to === user.email
-  );
+  const visibleNoti = notifications.filter((n) => (role === "Admin" ? n.to === "Admin" : n.to === user.email.toLowerCase()));
 
   return (
     <main className="min-h-screen bg-slate-50 p-6 text-slate-900">
@@ -461,16 +525,11 @@ export default function App() {
         <header className="flex flex-col justify-between gap-4 md:flex-row md:items-end">
           <div>
             <h1 className="text-3xl font-bold">Internal BTS Card Booking</h1>
-            <p className="text-slate-500">
-              Booking, fare lookup, card balance, cancel/return approval, in-app notification.
-            </p>
+            <p className="text-slate-500">Booking, fare lookup, card balance, cancel/return approval, in-app notification.</p>
           </div>
 
           <div className="flex gap-2">
-            <Button
-              variant={role === "User" ? "primary" : "outline"}
-              onClick={() => setRole("User")}
-            >
+            <Button variant={role === "User" ? "primary" : "outline"} onClick={() => setRole("User")}>
               User
             </Button>
 
@@ -497,15 +556,13 @@ export default function App() {
             ...(role === "Admin" ? [["admin", "Admin"]] : []),
             ["noti", `Notifications (${visibleNoti.length})`],
           ].map(([key, label]) => (
-            <Button
-              key={key}
-              variant={tab === key ? "primary" : "outline"}
-              onClick={() => setTab(key)}
-            >
+            <Button key={key} variant={tab === key ? "primary" : "outline"} onClick={() => setTab(key)}>
               {label}
             </Button>
           ))}
         </nav>
+
+        {loading && <div className="rounded-xl bg-amber-50 p-3 text-sm text-amber-800">Loading / Saving data...</div>}
 
         {tab === "booking" && (
           <div className="grid gap-6 lg:grid-cols-3">
@@ -513,12 +570,7 @@ export default function App() {
               <h2 className="mb-4 text-xl font-bold">Create Booking</h2>
 
               <div className="grid gap-4 md:grid-cols-2">
-                <input
-                  className="rounded-xl border px-3 py-2"
-                  placeholder="Enter Name"
-                  value={user.name}
-                  onChange={(e) => setUser({ ...user, name: e.target.value })}
-                />
+                <input className="rounded-xl border px-3 py-2" placeholder="Enter Name" value={user.name} onChange={(e) => setUser({ ...user, name: e.target.value })} />
 
                 <input
                   className="rounded-xl border px-3 py-2"
@@ -527,27 +579,14 @@ export default function App() {
                   onChange={(e) => setUser({ ...user, email: e.target.value })}
                 />
 
-                <input
-                  className="rounded-xl border px-3 py-2"
-                  type="datetime-local"
-                  value={bookingAt}
-                  onChange={(e) => setBookingAt(e.target.value)}
-                />
+                <input className="rounded-xl border px-3 py-2" type="datetime-local" value={bookingAt} onChange={(e) => setBookingAt(e.target.value)} />
 
-                <select
-                  className="rounded-xl border px-3 py-2"
-                  value={trip}
-                  onChange={(e) => setTrip(e.target.value)}
-                >
+                <select className="rounded-xl border px-3 py-2" value={trip} onChange={(e) => setTrip(e.target.value)}>
                   <option value="oneway">One-way</option>
                   <option value="round">Round trip</option>
                 </select>
 
-                <select
-                  className="rounded-xl border px-3 py-2"
-                  value={origin}
-                  onChange={(e) => setOrigin(e.target.value)}
-                >
+                <select className="rounded-xl border px-3 py-2" value={origin} onChange={(e) => setOrigin(e.target.value)}>
                   {stations.map((s) => (
                     <option key={s.station_id} value={s.station_id}>
                       {s.station_id} - {s.station_name}
@@ -555,11 +594,7 @@ export default function App() {
                   ))}
                 </select>
 
-                <select
-                  className="rounded-xl border px-3 py-2"
-                  value={destination}
-                  onChange={(e) => setDestination(e.target.value)}
-                >
+                <select className="rounded-xl border px-3 py-2" value={destination} onChange={(e) => setDestination(e.target.value)}>
                   {stations.map((s) => (
                     <option key={s.station_id} value={s.station_id}>
                       {s.station_id} - {s.station_name}
@@ -576,11 +611,7 @@ export default function App() {
                 </div>
               </div>
 
-              <Button
-                className="mt-5 w-full py-3"
-                onClick={createBooking}
-                disabled={!selectedCard || fare <= 0}
-              >
+              <Button className="mt-5 w-full py-3" onClick={createBooking} disabled={!selectedCard || fare <= 0 || loading}>
                 Reserve Card
               </Button>
             </Card>
@@ -595,9 +626,7 @@ export default function App() {
                   <Badge tone="green">Enough balance</Badge>
                 </div>
               ) : (
-                <div className="rounded-2xl bg-red-50 p-4 text-red-700">
-                  No card has enough balance.
-                </div>
+                <div className="rounded-2xl bg-red-50 p-4 text-red-700">No card has enough balance.</div>
               )}
 
               <div className="mt-4 space-y-3">
@@ -607,9 +636,7 @@ export default function App() {
                       <b>{c.card_id}</b>
                       <div className="text-sm text-slate-500">{c.balance} THB</div>
                     </div>
-                    <Badge tone={c.card_status === "Available" ? "green" : "amber"}>
-                      {c.card_status}
-                    </Badge>
+                    <Badge tone={c.card_status === "Available" ? "green" : "amber"}>{c.card_status}</Badge>
                   </div>
                 ))}
               </div>
@@ -619,20 +646,16 @@ export default function App() {
 
         {tab === "bookings" && (
           <Card>
-            <h2 className="mb-4 text-xl font-bold">Booking List</h2>
+            <div className="mb-4 flex items-center justify-between gap-2">
+              <h2 className="text-xl font-bold">Booking List</h2>
+              <Button variant="outline" onClick={refreshAll}>Refresh</Button>
+            </div>
 
             <div className="space-y-3">
-              {visibleBookings.length === 0 && (
-                <div className="rounded-xl border border-dashed p-6 text-center text-slate-500">
-                  No booking yet
-                </div>
-              )}
+              {visibleBookings.length === 0 && <div className="rounded-xl border border-dashed p-6 text-center text-slate-500">No booking yet</div>}
 
               {visibleBookings.map((b) => (
-                <div
-                  key={b.id}
-                  className="grid gap-3 rounded-xl border p-4 md:grid-cols-[1fr_auto] md:items-center"
-                >
+                <div key={b.id} className="grid gap-3 rounded-xl border p-4 md:grid-cols-[1fr_auto] md:items-center">
                   <div>
                     <div className="flex flex-wrap items-center gap-2">
                       <b>{b.id}</b>
@@ -653,15 +676,9 @@ export default function App() {
                   </div>
 
                   <div className="flex flex-wrap gap-2">
-                    <Button variant="outline" onClick={() => editTrip(b.id)} disabled={b.status !== "Reserved"}>
-                      Edit Trip
-                    </Button>
-                    <Button variant="outline" onClick={() => requestCancel(b.id)} disabled={b.status !== "Reserved"}>
-                      Cancel
-                    </Button>
-                    <Button variant="outline" onClick={() => requestReturn(b.id)} disabled={b.status !== "Reserved"}>
-                      Return
-                    </Button>
+                    <Button variant="outline" onClick={() => editTrip(b.id)} disabled={b.status !== "Reserved"}>Edit Trip</Button>
+                    <Button variant="outline" onClick={() => requestCancel(b.id)} disabled={b.status !== "Reserved"}>Cancel</Button>
+                    <Button variant="outline" onClick={() => requestReturn(b.id)} disabled={b.status !== "Reserved"}>Return</Button>
                   </div>
                 </div>
               ))}
@@ -672,38 +689,31 @@ export default function App() {
         {tab === "admin" && role === "Admin" && (
           <div className="grid gap-6 lg:grid-cols-2">
             <Card>
-              <h2 className="mb-4 text-xl font-bold">Admin Approval Queue</h2>
+              <div className="mb-4 flex items-center justify-between gap-2">
+                <h2 className="text-xl font-bold">Admin Approval Queue</h2>
+                <Button variant="outline" onClick={refreshAll}>Refresh</Button>
+              </div>
 
               <div className="space-y-3">
-                {bookings.filter((b) => b.status.includes("Requested")).length === 0 && (
-                  <div className="rounded-xl border border-dashed p-6 text-center text-slate-500">
-                    No pending request
-                  </div>
-                )}
+                {bookings.filter((b) => b.status.includes("Requested")).length === 0 && <div className="rounded-xl border border-dashed p-6 text-center text-slate-500">No pending request</div>}
 
-                {bookings
-                  .filter((b) => b.status.includes("Requested"))
-                  .map((b) => (
-                    <div key={b.id} className="rounded-xl border p-4">
-                      <div className="flex items-center justify-between">
-                        <b>{b.id}</b>
-                        <Badge tone="amber">{b.status}</Badge>
-                      </div>
-
-                      <div className="text-sm text-slate-600">
-                        {b.userName} / {b.cardId} / {b.fare} THB
-                      </div>
-
-                      <div className="mt-3 flex gap-2">
-                        {b.status === "Cancel Requested" && (
-                          <Button onClick={() => approveCancel(b.id)}>Approve Cancel</Button>
-                        )}
-                        {b.status === "Return Requested" && (
-                          <Button onClick={() => approveReturn(b.id)}>Approve Return</Button>
-                        )}
-                      </div>
+                {bookings.filter((b) => b.status.includes("Requested")).map((b) => (
+                  <div key={b.id} className="rounded-xl border p-4">
+                    <div className="flex items-center justify-between">
+                      <b>{b.id}</b>
+                      <Badge tone="amber">{b.status}</Badge>
                     </div>
-                  ))}
+
+                    <div className="text-sm text-slate-600">
+                      {b.userName} / {b.cardId} / {b.fare} THB
+                    </div>
+
+                    <div className="mt-3 flex gap-2">
+                      {b.status === "Cancel Requested" && <Button onClick={() => approveCancel(b.id)}>Approve Cancel</Button>}
+                      {b.status === "Return Requested" && <Button onClick={() => approveReturn(b.id)}>Approve Return</Button>}
+                    </div>
+                  </div>
+                ))}
               </div>
             </Card>
 
@@ -712,10 +722,7 @@ export default function App() {
 
               <div className="space-y-3">
                 {cards.map((c) => (
-                  <div
-                    key={c.card_id}
-                    className="grid grid-cols-[1fr_120px_auto_auto] items-center gap-3 rounded-xl border p-3"
-                  >
+                  <div key={c.card_id} className="grid grid-cols-[1fr_120px_auto_auto] items-center gap-3 rounded-xl border p-3">
                     <div>
                       <b>{c.card_id}</b>
                       <div className="text-sm text-slate-500">{c.card_status}</div>
@@ -727,25 +734,16 @@ export default function App() {
                       value={c.balance}
                       onChange={(e) =>
                         setCards((prev) =>
-                          prev.map((x) =>
-                            x.card_id === c.card_id
-                              ? { ...x, balance: Number(e.target.value) }
-                              : x
-                          )
+                          prev.map((x) => (x.card_id === c.card_id ? { ...x, balance: Number(e.target.value) } : x))
                         )
                       }
                     />
 
-                    <Button
-                      variant="outline"
-                      onClick={() => updateCardBalance(c.card_id, Number(c.balance))}
-                    >
+                    <Button variant="outline" onClick={() => updateCardBalance(c.card_id, Number(c.balance))}>
                       Save
                     </Button>
 
-                    <Badge tone={c.card_status === "Available" ? "green" : "amber"}>
-                      {c.card_status}
-                    </Badge>
+                    <Badge tone={c.card_status === "Available" ? "green" : "amber"}>{c.card_status}</Badge>
                   </div>
                 ))}
               </div>
@@ -755,14 +753,13 @@ export default function App() {
 
         {tab === "noti" && (
           <Card>
-            <h2 className="mb-4 text-xl font-bold">In-App Notifications</h2>
+            <div className="mb-4 flex items-center justify-between gap-2">
+              <h2 className="text-xl font-bold">In-App Notifications</h2>
+              <Button variant="outline" onClick={refreshAll}>Refresh</Button>
+            </div>
 
             <div className="space-y-3">
-              {visibleNoti.length === 0 && (
-                <div className="rounded-xl border border-dashed p-6 text-center text-slate-500">
-                  No notification
-                </div>
-              )}
+              {visibleNoti.length === 0 && <div className="rounded-xl border border-dashed p-6 text-center text-slate-500">No notification</div>}
 
               {visibleNoti.map((n) => (
                 <div key={n.id} className="rounded-xl border p-4">
